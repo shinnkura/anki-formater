@@ -27,57 +27,60 @@ var (
 )
 
 func main() {
-    // 使い方:
-    //  1) すべてのZIP: go run main.go
-    //  2) 特定ZIPのみ: go run main.go -in data/raw/lln_anki_items_2025-8-9_update_542740.zip
-    //  3) 単体TSV    : go run main.go -in items.csv
-    in := flag.String("in", "", "input ZIP or TSV file (optional). When empty, process all ZIPs under -rawdir")
-    rawdir := flag.String("rawdir", "data/raw", "directory containing zip files")
-    procdir := flag.String("procdir", "data/processed", "directory to write outputs")
-    color := flag.String("color", "rgb(255, 189, 128)", "color for cloze terms (e.g. #e91e63 or red)")
-    flag.Parse()
+	// 使い方:
+	//  1) すべてのZIP: go run main.go
+	//  2) 特定ZIPのみ: go run main.go -in data/raw/lln_anki_items_2025-8-9_update_542740.zip
+	//  3) 単体TSV    : go run main.go -in items.csv
+	in := flag.String("in", "", "input ZIP or TSV file (optional). When empty, process all ZIPs under -rawdir")
+	rawdir := flag.String("rawdir", "data/raw", "directory containing zip files")
+	procdir := flag.String("procdir", "data/processed", "directory to write outputs")
+	color := flag.String("color", "rgb(255, 189, 128)", "color for cloze terms (e.g. #e91e63 or red)")
 
-    check(os.MkdirAll(*procdir, 0o755))
+	ankiMedia := flag.String("ankimedia",
+		"/Users/nakaokashinzo/Library/Application Support/Anki2/ユーザー 1/collection.media",
+		"path to Anki collection.media")
+	overwrite := flag.Bool("overwrite", true, "overwrite media files if already exist in Anki media folder")
+	flag.Parse()
 
-    switch {
-    case *in != "":
-        // -in に .zip または .tsv/.csv を指定可能
-        ext := strings.ToLower(filepath.Ext(*in))
-        out := filepath.Join(*procdir, baseNameNoExt(*in)+"_out.tsv")
-        if ext == ".zip" {
-            check(processZip(*in, out, *color))
-            fmt.Printf("OK(zip): %s -> %s\n", *in, out)
-        } else {
-            check(processTSVFile(*in, out, *color))
-            fmt.Printf("OK(tsv): %s -> %s\n", *in, out)
-        }
+	check(os.MkdirAll(*procdir, 0o755))
+	check(os.MkdirAll(*ankiMedia, 0o755))
 
-    default:
-        // rawdir 内のZIP一括処理
-        entries, err := os.ReadDir(*rawdir)
-        check(err)
+	switch {
+	case *in != "":
+		ext := strings.ToLower(filepath.Ext(*in))
+		out := filepath.Join(*procdir, baseNameNoExt(*in)+"_out.tsv")
+		if ext == ".zip" {
+			check(processZip(*in, out, *color, *ankiMedia, *overwrite))
+			fmt.Printf("OK(zip): %s -> %s\n", *in, out)
+		} else {
+			check(processTSVFile(*in, out, *color))
+			fmt.Printf("OK(tsv): %s -> %s\n", *in, out)
+		}
+	default:
+		entries, err := os.ReadDir(*rawdir)
+		check(err)
 
-        foundZip := false
-        for _, e := range entries {
-            if e.IsDir() {
-                continue
-            }
-            if strings.HasSuffix(strings.ToLower(e.Name()), ".zip") {
-                foundZip = true
-                zipPath := filepath.Join(*rawdir, e.Name())
-                out := filepath.Join(*procdir, baseNameNoExt(zipPath)+"_out.tsv")
-                check(processZip(zipPath, out, *color))
-                fmt.Printf("OK: %s -> %s\n", zipPath, out)
-            }
-        }
-        if !foundZip {
-            fmt.Printf("no zip files found in %s\n", *rawdir)
-        }
-    }
+		foundZip := false
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			if strings.HasSuffix(strings.ToLower(e.Name()), ".zip") {
+				foundZip = true
+				zipPath := filepath.Join(*rawdir, e.Name())
+				out := filepath.Join(*procdir, baseNameNoExt(zipPath)+"_out.tsv")
+				check(processZip(zipPath, out, *color, *ankiMedia, *overwrite))
+				fmt.Printf("OK: %s -> %s\n", zipPath, out)
+			}
+		}
+		if !foundZip {
+			fmt.Printf("no zip files found in %s\n", *rawdir)
+		}
+	}
 }
 
-// ----- ZIP 内の item.csv を探して処理 -----
-func processZip(zipPath, outPath, color string) error {
+// ----- ZIP を処理：item.csv を変換 + media/ を Anki にコピー -----
+func processZip(zipPath, outPath, color, ankiMedia string, overwrite bool) error {
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return err
@@ -87,15 +90,22 @@ func processZip(zipPath, outPath, color string) error {
 	var target *zip.File
 	var fallback *zip.File
 
+	// media コピー & item.csv 探索
+	copied, skipped, err := copyZipMediaFiles(zr.File, ankiMedia, overwrite)
+	if err != nil {
+		return fmt.Errorf("copy media from %s: %w", zipPath, err)
+	}
+	if copied+skipped > 0 {
+		fmt.Printf("media: copied=%d skipped=%d -> %s\n", copied, skipped, ankiMedia)
+	}
+
 	for _, f := range zr.File {
 		base := strings.ToLower(path.Base(f.Name)) // zip 内は常に '/' 区切り
 		switch base {
 		case "item.csv", "items.csv":
 			target = f
-			break
 		default:
 			if strings.HasSuffix(base, ".csv") {
-				// 念のためCSVが1個だけのケースに備えて候補も保持
 				fallback = f
 			}
 		}
@@ -116,6 +126,61 @@ func processZip(zipPath, outPath, color string) error {
 	return processTSV(rc, outPath, color)
 }
 
+// ----- media/ 内のファイルを Anki の collection.media にコピー -----
+func copyZipMediaFiles(files []*zip.File, dest string, overwrite bool) (copied, skipped int, err error) {
+	for _, f := range files {
+		// 正規化してトップレベルが "media" かを判定（大文字小文字無視）
+		name := strings.TrimLeft(f.Name, "/\\")
+		parts := strings.Split(name, "/")
+		if len(parts) == 0 || !strings.EqualFold(parts[0], "media") {
+			continue
+		}
+		rel := strings.Join(parts[1:], "/")
+		if rel == "" || f.FileInfo().IsDir() {
+			continue
+		}
+
+		dstPath := filepath.Join(dest, filepath.FromSlash(rel))
+		if !overwrite {
+			if _, statErr := os.Stat(dstPath); statErr == nil {
+				skipped++
+				continue
+			}
+		}
+
+		check(os.MkdirAll(filepath.Dir(dstPath), 0o755))
+
+		src, openErr := f.Open()
+		if openErr != nil {
+			return copied, skipped, openErr
+		}
+		func() {
+			defer src.Close()
+			tmp := dstPath + ".tmp~"
+			out, createErr := os.Create(tmp)
+			if createErr != nil {
+				err = createErr
+				return
+			}
+			if _, err = io.Copy(out, src); err == nil {
+				err = out.Close()
+			} else {
+				out.Close()
+			}
+			if err == nil {
+				err = os.Rename(tmp, dstPath)
+			} else {
+				_ = os.Remove(tmp)
+			}
+		}()
+		if err != nil {
+			return copied, skipped, err
+		}
+		copied++
+	}
+	return copied, skipped, nil
+}
+
 // ----- 単体TSVファイルを処理 -----
 func processTSVFile(inPath, outPath, color string) error {
 	inFile, err := os.Open(inPath)
@@ -129,7 +194,6 @@ func processTSVFile(inPath, outPath, color string) error {
 // ----- TSV ストリームを処理 -----
 func processTSV(r io.Reader, outPath, color string) error {
 	br := bufio.NewReader(r)
-	// UTF-8 BOM 対策（あれば除去）
 	br = stripBOM(br)
 
 	check(os.MkdirAll(filepath.Dir(outPath), 0o755))
@@ -281,6 +345,7 @@ func stripTags(s string) string {
 	return strings.TrimSpace(html.UnescapeString(b.String()))
 }
 
+// UTF-8 BOM を除去
 func stripBOM(r *bufio.Reader) *bufio.Reader {
 	if b, _ := r.Peek(3); len(b) == 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF {
 		_, _ = r.Discard(3)
