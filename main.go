@@ -28,9 +28,9 @@ var (
 
 func main() {
 	// 使い方:
-	//  1) すべてのZIP: go run main.go
-	//  2) 特定ZIPのみ: go run main.go -in data/raw/lln_anki_items_2025-8-9_update_542740.zip
-	//  3) 単体TSV    : go run main.go -in items.csv
+	//  1) すべてのZIPを差分処理: go run .
+	//  2) 特定ZIPのみ処理     : go run . -in data/raw/xxx.zip
+	//  3) 単体TSVを処理       : go run . -in items.csv
 	in := flag.String("in", "", "input ZIP or TSV file (optional). When empty, process all ZIPs under -rawdir")
 	rawdir := flag.String("rawdir", "data/raw", "directory containing zip files")
 	procdir := flag.String("procdir", "data/processed", "directory to write outputs")
@@ -39,7 +39,9 @@ func main() {
 	ankiMedia := flag.String("ankimedia",
 		"/Users/nakaokashinzo/Library/Application Support/Anki2/ユーザー 1/collection.media",
 		"path to Anki collection.media")
-	overwrite := flag.Bool("overwrite", true, "overwrite media files if already exist in Anki media folder")
+	overwrite := flag.Bool("overwrite", true, "overwrite media files in Anki media folder")
+	force := flag.Bool("force", false, "reprocess even if output TSV already exists")
+
 	flag.Parse()
 
 	check(os.MkdirAll(*procdir, 0o755))
@@ -65,13 +67,20 @@ func main() {
 			if e.IsDir() {
 				continue
 			}
-			if strings.HasSuffix(strings.ToLower(e.Name()), ".zip") {
-				foundZip = true
-				zipPath := filepath.Join(*rawdir, e.Name())
-				out := filepath.Join(*procdir, baseNameNoExt(zipPath)+"_out.tsv")
-				check(processZip(zipPath, out, *color, *ankiMedia, *overwrite))
-				fmt.Printf("OK: %s -> %s\n", zipPath, out)
+			if !strings.HasSuffix(strings.ToLower(e.Name()), ".zip") {
+				continue
 			}
+			foundZip = true
+			zipPath := filepath.Join(*rawdir, e.Name())
+			out := filepath.Join(*procdir, baseNameNoExt(zipPath)+"_out.tsv")
+
+			if !*force && fileExists(out) {
+				fmt.Printf("skip (exists): %s -> %s\n", zipPath, out)
+				continue
+			}
+
+			check(processZip(zipPath, out, *color, *ankiMedia, *overwrite))
+			fmt.Printf("OK: %s -> %s\n", zipPath, out)
 		}
 		if !foundZip {
 			fmt.Printf("no zip files found in %s\n", *rawdir)
@@ -90,7 +99,7 @@ func processZip(zipPath, outPath, color, ankiMedia string, overwrite bool) error
 	var target *zip.File
 	var fallback *zip.File
 
-	// media コピー & item.csv 探索
+	// media コピー
 	copied, skipped, err := copyZipMediaFiles(zr.File, ankiMedia, overwrite)
 	if err != nil {
 		return fmt.Errorf("copy media from %s: %w", zipPath, err)
@@ -99,13 +108,14 @@ func processZip(zipPath, outPath, color, ankiMedia string, overwrite bool) error
 		fmt.Printf("media: copied=%d skipped=%d -> %s\n", copied, skipped, ankiMedia)
 	}
 
+	// item.csv / items.csv / 他CSV の順で1つ選択
 	for _, f := range zr.File {
 		base := strings.ToLower(path.Base(f.Name)) // zip 内は常に '/' 区切り
 		switch base {
 		case "item.csv", "items.csv":
 			target = f
 		default:
-			if strings.HasSuffix(base, ".csv") {
+			if strings.HasSuffix(base, ".csv") && fallback == nil {
 				fallback = f
 			}
 		}
@@ -129,7 +139,6 @@ func processZip(zipPath, outPath, color, ankiMedia string, overwrite bool) error
 // ----- media/ 内のファイルを Anki の collection.media にコピー -----
 func copyZipMediaFiles(files []*zip.File, dest string, overwrite bool) (copied, skipped int, err error) {
 	for _, f := range files {
-		// 正規化してトップレベルが "media" かを判定（大文字小文字無視）
 		name := strings.TrimLeft(f.Name, "/\\")
 		parts := strings.Split(name, "/")
 		if len(parts) == 0 || !strings.EqualFold(parts[0], "media") {
@@ -141,13 +150,10 @@ func copyZipMediaFiles(files []*zip.File, dest string, overwrite bool) (copied, 
 		}
 
 		dstPath := filepath.Join(dest, filepath.FromSlash(rel))
-		if !overwrite {
-			if _, statErr := os.Stat(dstPath); statErr == nil {
-				skipped++
-				continue
-			}
+		if !overwrite && fileExists(dstPath) {
+			skipped++
+			continue
 		}
-
 		check(os.MkdirAll(filepath.Dir(dstPath), 0o755))
 
 		src, openErr := f.Open()
@@ -248,7 +254,7 @@ func transform(h, sound, color string) (string, string) {
 		h = reTransDiv.ReplaceAllString(h, "")
 	}
 
-	// 3) Cloze → タグを除去したプレーンテキストにして、色付きで差し替え
+	// 3) Cloze → タグ除去したプレーンテキストを色付きに
 	h = reCloze.ReplaceAllStringFunc(h, func(s string) string {
 		g := reCloze.FindStringSubmatch(s)
 		raw := ""
@@ -262,7 +268,7 @@ func transform(h, sound, color string) (string, string) {
 		return `<span style="color:` + color + `;">` + html.EscapeString(plain) + `</span>`
 	})
 
-	// 3.5) Cloze外に残る dc-down / dc-gap の <span> を剥がす
+	// 3.5) Cloze外に残る装飾を剥がす
 	for {
 		before := h
 		h = reUnwrapDown.ReplaceAllString(h, "$1")
@@ -326,7 +332,6 @@ func transform(h, sound, color string) (string, string) {
 	return h, ja
 }
 
-// 訳文抽出や cloze 内のタグ除去に使用
 func stripTags(s string) string {
 	inTag := false
 	var b strings.Builder
@@ -345,7 +350,6 @@ func stripTags(s string) string {
 	return strings.TrimSpace(html.UnescapeString(b.String()))
 }
 
-// UTF-8 BOM を除去
 func stripBOM(r *bufio.Reader) *bufio.Reader {
 	if b, _ := r.Peek(3); len(b) == 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF {
 		_, _ = r.Discard(3)
@@ -356,6 +360,11 @@ func stripBOM(r *bufio.Reader) *bufio.Reader {
 func baseNameNoExt(p string) string {
 	base := filepath.Base(p)
 	return strings.TrimSuffix(base, filepath.Ext(base))
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 func check(err error) {
