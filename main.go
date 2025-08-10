@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"encoding/csv"
 	"flag"
@@ -8,6 +9,8 @@ import (
 	"html"
 	"io"
 	"os"
+	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -15,45 +18,142 @@ import (
 var (
 	reStyleBlock = regexp.MustCompile(`(?is)<style.*?>.*?</style>`)
 	reTransDiv   = regexp.MustCompile(`(?is)<div\s+class="dc-line\s+dc-translation[^"]*"\s*>(.*?)</div>`)
-	// {{c1::...}} / {{c2::...::hint}} を検出
-	reCloze = regexp.MustCompile(`(?is)\{\{c\d+::(.*?)(?:::[^}]*)?\}\}`)
-
-	reImage   = regexp.MustCompile(`(?is)<div\s+class="([^"]*\bdc-image[^"]*)"\s+style="([^"]*?)"\s*></div>`)
-	reBgImage = regexp.MustCompile(`(?is)background-image\s*:\s*url\(([^)]+)\)`)
-	reCardDiv = regexp.MustCompile(`(?is)<div\s+class="([^"]*\bdc-card[^"]*)"(.*?)>`)
-
-	// dc-down / dc-gap を“外す”（Cloze外に残っている場合に備えて）
+	reCloze      = regexp.MustCompile(`(?is)\{\{c\d+::(.*?)(?:::[^}]*)?\}\}`)
+	reImage      = regexp.MustCompile(`(?is)<div\s+class="([^"]*\bdc-image[^"]*)"\s+style="([^"]*?)"\s*></div>`)
+	reBgImage    = regexp.MustCompile(`(?is)background-image\s*:\s*url\(([^)]+)\)`)
+	reCardDiv    = regexp.MustCompile(`(?is)<div\s+class="([^"]*\bdc-card[^"]*)"(.*?)>`)
 	reUnwrapDown = regexp.MustCompile(`(?is)<span[^>]*class="[^"]*\bdc-down\b[^"]*"[^>]*>(.*?)</span>`)
 	reUnwrapGap  = regexp.MustCompile(`(?is)<span[^>]*class="[^"]*\bdc-gap\b[^"]*"[^>]*>(.*?)</span>`)
 )
 
 func main() {
-	in := flag.String("in", "items.csv", "input TSV file (3 cols: html, sound, tags)")
-	out := flag.String("out", "items_out.tsv", "output TSV file (2 cols: html, translation)")
-	color := flag.String("color", "#1569C7", "color for cloze terms (e.g. #e91e63 or red)")
-	flag.Parse()
+    // 使い方:
+    //  1) すべてのZIP: go run main.go
+    //  2) 特定ZIPのみ: go run main.go -in data/raw/lln_anki_items_2025-8-9_update_542740.zip
+    //  3) 単体TSV    : go run main.go -in items.csv
+    in := flag.String("in", "", "input ZIP or TSV file (optional). When empty, process all ZIPs under -rawdir")
+    rawdir := flag.String("rawdir", "data/raw", "directory containing zip files")
+    procdir := flag.String("procdir", "data/processed", "directory to write outputs")
+    color := flag.String("color", "rgb(255, 189, 128)", "color for cloze terms (e.g. #e91e63 or red)")
+    flag.Parse()
 
-	inFile, err := os.Open(*in)
-	check(err)
+    check(os.MkdirAll(*procdir, 0o755))
+
+    switch {
+    case *in != "":
+        // -in に .zip または .tsv/.csv を指定可能
+        ext := strings.ToLower(filepath.Ext(*in))
+        out := filepath.Join(*procdir, baseNameNoExt(*in)+"_out.tsv")
+        if ext == ".zip" {
+            check(processZip(*in, out, *color))
+            fmt.Printf("OK(zip): %s -> %s\n", *in, out)
+        } else {
+            check(processTSVFile(*in, out, *color))
+            fmt.Printf("OK(tsv): %s -> %s\n", *in, out)
+        }
+
+    default:
+        // rawdir 内のZIP一括処理
+        entries, err := os.ReadDir(*rawdir)
+        check(err)
+
+        foundZip := false
+        for _, e := range entries {
+            if e.IsDir() {
+                continue
+            }
+            if strings.HasSuffix(strings.ToLower(e.Name()), ".zip") {
+                foundZip = true
+                zipPath := filepath.Join(*rawdir, e.Name())
+                out := filepath.Join(*procdir, baseNameNoExt(zipPath)+"_out.tsv")
+                check(processZip(zipPath, out, *color))
+                fmt.Printf("OK: %s -> %s\n", zipPath, out)
+            }
+        }
+        if !foundZip {
+            fmt.Printf("no zip files found in %s\n", *rawdir)
+        }
+    }
+}
+
+// ----- ZIP 内の item.csv を探して処理 -----
+func processZip(zipPath, outPath, color string) error {
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+
+	var target *zip.File
+	var fallback *zip.File
+
+	for _, f := range zr.File {
+		base := strings.ToLower(path.Base(f.Name)) // zip 内は常に '/' 区切り
+		switch base {
+		case "item.csv", "items.csv":
+			target = f
+			break
+		default:
+			if strings.HasSuffix(base, ".csv") {
+				// 念のためCSVが1個だけのケースに備えて候補も保持
+				fallback = f
+			}
+		}
+	}
+	if target == nil {
+		target = fallback
+	}
+	if target == nil {
+		return fmt.Errorf("item.csv not found in %s", zipPath)
+	}
+
+	rc, err := target.Open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	return processTSV(rc, outPath, color)
+}
+
+// ----- 単体TSVファイルを処理 -----
+func processTSVFile(inPath, outPath, color string) error {
+	inFile, err := os.Open(inPath)
+	if err != nil {
+		return err
+	}
 	defer inFile.Close()
+	return processTSV(inFile, outPath, color)
+}
 
-	r := csv.NewReader(bufio.NewReader(inFile))
-	r.Comma = '\t'
-	r.LazyQuotes = true
+// ----- TSV ストリームを処理 -----
+func processTSV(r io.Reader, outPath, color string) error {
+	br := bufio.NewReader(r)
+	// UTF-8 BOM 対策（あれば除去）
+	br = stripBOM(br)
 
-	outFile, err := os.Create(*out)
-	check(err)
+	check(os.MkdirAll(filepath.Dir(outPath), 0o755))
+	outFile, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
 	defer outFile.Close()
 
-	w := csv.NewWriter(outFile)
-	w.Comma = '\t'
+	cr := csv.NewReader(br)
+	cr.Comma = '\t'
+	cr.LazyQuotes = true
+
+	cw := csv.NewWriter(outFile)
+	cw.Comma = '\t'
 
 	for {
-		rec, err := r.Read()
+		rec, err := cr.Read()
 		if err == io.EOF {
 			break
 		}
-		check(err)
+		if err != nil {
+			return err
+		}
 		if len(rec) == 0 {
 			continue
 		}
@@ -64,13 +164,13 @@ func main() {
 			sound = strings.TrimSpace(rec[1])
 		}
 
-		htmlOut, ja := transform(htmlIn, sound, *color)
-		check(w.Write([]string{htmlOut, ja}))
+		htmlOut, ja := transform(htmlIn, sound, color)
+		if err := cw.Write([]string{htmlOut, ja}); err != nil {
+			return err
+		}
 	}
-	w.Flush()
-	check(w.Error())
-
-	fmt.Printf("done: %s\n", *out)
+	cw.Flush()
+	return cw.Error()
 }
 
 func transform(h, sound, color string) (string, string) {
@@ -91,11 +191,10 @@ func transform(h, sound, color string) (string, string) {
 		if len(g) >= 2 {
 			raw = g[1]
 		}
-		plain := strings.TrimSpace(stripTags(raw)) // ★タグ除去
+		plain := strings.TrimSpace(stripTags(raw))
 		if plain == "" {
-			return "" //万一中身が空なら消す
+			return ""
 		}
-		// プレーン文字列は最小限だけエスケープ（< > & など）
 		return `<span style="color:` + color + `;">` + html.EscapeString(plain) + `</span>`
 	})
 
@@ -160,7 +259,6 @@ func transform(h, sound, color string) (string, string) {
 
 	// 軽い整形
 	h = strings.ReplaceAll(h, "  ", " ")
-
 	return h, ja
 }
 
@@ -181,6 +279,18 @@ func stripTags(s string) string {
 		}
 	}
 	return strings.TrimSpace(html.UnescapeString(b.String()))
+}
+
+func stripBOM(r *bufio.Reader) *bufio.Reader {
+	if b, _ := r.Peek(3); len(b) == 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF {
+		_, _ = r.Discard(3)
+	}
+	return r
+}
+
+func baseNameNoExt(p string) string {
+	base := filepath.Base(p)
+	return strings.TrimSuffix(base, filepath.Ext(base))
 }
 
 func check(err error) {
